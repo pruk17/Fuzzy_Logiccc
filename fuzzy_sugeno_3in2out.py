@@ -1,29 +1,28 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-fuzzy_sugeno_3in2out_with_feeling_fixed.py
--------------------------------------------
-Sugeno (zero-order) fuzzy controller with 3 inputs and 2 outputs, plus verbose printing.
-Inputs:
-  - EMG_RMS_mV   (numeric) -> Low/Med/High
-  - Pressure_N   (numeric) -> Low/Med/High
-  - Pain_Score   (numeric, derived from 'feeling' text) -> Low/Med/High
-Outputs:
-  - Intensity_pct (0..100)
-  - Frequency_Hz  (~8..16)
-
-Run:
-  python fuzzy_sugeno_3in2out_with_feeling_fixed.py
-  # or
-  python fuzzy_sugeno_3in2out_with_feeling_fixed.py --in Muscle_Tension_DataSample.csv --out out.csv \
-      --emg-col EMG_RMS_mV --press-col Pressure_N --feel-col feeling
-"""
+# fuzzy_sugeno_3in2out_with_feeling_fixed.py
+# -------------------------------------------
+# Sugeno (zero-order) fuzzy controller with 3 inputs and 2 outputs, plus verbose printing.
+# Inputs:
+#   - EMG_RMS_mV   (numeric) -> Low/Med/High
+#   - Pressure_N   (numeric) -> Low/Med/High
+#   - Pain_Score   (numeric, derived from 'feeling' text) -> Low/Med/High
+# Outputs:
+#   - Intensity_pct (0..100)
+#   - Frequency_Hz  (~8..16)
+#
+# Run:
+#   python fuzzy_sugeno_3in2out_with_feeling_fixed.py
+#   # or
+#   python fuzzy_sugeno_3in2out_with_feeling_fixed.py --in Muscle_Tension_Data.csv --out out.csv \
+#       --emg-col EMG_RMS_mV --press-col Pressure_N --feel-col feeling \
+#       --topk 3 --min-w 0.10 --max-topline 120 --block 25 --topfmt compact
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Dict, List, Tuple, Optional
 
 import numpy as np
@@ -154,13 +153,23 @@ def build_massage_chair_sugeno_3in() -> SugenoSystem:
             ))
     return fis
 
-# ------------- Feeling mapping -------------
+# ------------- Feeling mapping (English only) -------------
 
 FEELING_MAP = {
-    "very pain": 90, "pain": 70, "little pain": 40, "ok": 50,
-    "relaxed": 20, "very relaxed": 10,
-    "เจ็บมาก": 90, "เจ็บ": 70, "เจ็บเล็กน้อย": 40, "ปกติ": 50, "ผ่อนคลาย": 20
+    "very relaxed": 10,
+    "relaxed": 20,
+    "calm": 20,
+    "ok": 50,
+    "normal": 50,
+    "neutral": 50,
+    "fine": 50,
+    "little pain": 40,
+    "mild pain": 40,
+    "pain": 70,
+    "severe pain": 90,
+    "very pain": 90,  # legacy
 }
+
 def feeling_to_score(text: Optional[str], default: float = 50.0) -> float:
     if text is None:
         return float(default)
@@ -169,30 +178,121 @@ def feeling_to_score(text: Optional[str], default: float = 50.0) -> float:
 
 # ------------- Verbose evaluator -------------
 
+class TopFmt(str, Enum):
+    long = "long"       # e.g., (EMG=Med, P=Med, Pain=Low)
+    compact = "compact" # e.g., (E=M, P=M, Pa=L)
+
+def _fmt_ant(a: str, b: str, c: str, fmt: TopFmt = TopFmt.compact) -> str:
+    if fmt == TopFmt.long:
+        return f"(EMG={a}, P={b}, Pain={c})"
+    abbr = {"Low": "L", "Med": "M", "High": "H"}
+    return f"(E={abbr.get(a,a[:1])}, P={abbr.get(b,b[:1])}, Pa={abbr.get(c,c[:1])})"
+
+def _wrap_parts(parts: List[str], max_width: int, indent: int = 4, prefix: str = "Top: ") -> List[str]:
+    lines: List[str] = []
+    cur = " " * indent + prefix
+    sep = " | "
+    for p in parts:
+        add = ("" if cur.strip().endswith(prefix.strip()) else sep) + p
+        if len(cur) + len(add) <= max_width:
+            cur += add
+        else:
+            lines.append(cur)
+            cur = " " * indent + prefix + p
+    lines.append(cur)
+    return lines
+
 def _top_k_rules(details: List[Tuple[float, SugenoRule]], k: int = 3) -> List[Tuple[float, Tuple[str, str, str]]]:
     top: List[Tuple[float, Tuple[str, str, str]]] = []
     for w, r in details[:k]:
         ants = [a[1] for a in r.antecedents]
-        if len(ants) >= 3:
-            top.append((w, (ants[0], ants[1], ants[2])))
-        else:
-            # pad for safety
-            while len(ants) < 3:
-                ants.append("-")
-            top.append((w, (ants[0], ants[1], ants[2])))
+        while len(ants) < 3:
+            ants.append("-")
+        top.append((w, (ants[0], ants[1], ants[2])))
     return top
 
-def evaluate_csv_with_print(fis: SugenoSystem, df: pd.DataFrame,
-                            emg_col: str = "EMG_RMS_mV", press_col: str = "Pressure_N",
-                            feel_col: str = "feeling", out_path: Optional[str] = None) -> pd.DataFrame:
+def evaluate_csv_with_print(
+    fis: SugenoSystem,
+    df: pd.DataFrame,
+    emg_col: str = "EMG_RMS_mV",
+    press_col: str = "Pressure_N",
+    feel_col: str = "feeling",
+    out_path: Optional[str] = None,
+    *,
+    dataset_name: Optional[str] = None,
+    topk: int = 3,
+    min_w: float = 0.10,
+    max_topline_chars: Optional[int] = None,
+    block: int = 25,
+    topfmt: TopFmt = TopFmt.compact,
+) -> pd.DataFrame:
+    """Evaluate CSV row-by-row and print a neat, readable table to terminal."""
     pain_scores: List[float] = []
     out_I: List[float] = []
     out_F: List[float] = []
 
+    # column widths
+    Wt, Wemg, Wp, Wfeel, Wpain, Wint, Wfreq = 7, 9, 12, 16, 10, 11, 10
+
+    # de-duplicate rows (avoid noisy repeated prints if dataset has duplicates)
+    subset_cols = [c for c in ["time_s", emg_col, press_col, feel_col] if c in df.columns]
+    if subset_cols:
+        df = (
+            df.sort_values(subset_cols)
+              .drop_duplicates(subset=subset_cols, keep="first")
+              .reset_index(drop=True)
+        )
+
+    # auto-detect terminal width
+    if max_topline_chars is None:
+        try:
+            cols = shutil.get_terminal_size((120, 20)).columns
+        except Exception:
+            cols = 120
+        max_topline_chars = max(60, cols - 2)
+
+    # ---------- CONFIG HEADER (experiment parameters) ----------
+    cfg_lines = [
+        "Run configuration:",
+        f"  Dataset            : {dataset_name or '<DataFrame>'}",
+        f"  Columns            : EMG='{emg_col}', Pressure='{press_col}', Feeling='{feel_col}'",
+        f"  Rules/Outputs      : {len(fis.rules)} rules -> {', '.join(fis.outputs)}",
+        f"  Printing params    : TOPK={topk}, MIN_W={min_w:.3f}, MAX_TOPLINE={max_topline_chars}, BLOCK={block}, TOPFMT={topfmt}",
+        f"  Feeling map keys   : {', '.join(sorted(FEELING_MAP.keys()))}",
+    ]
+    max_len = max(len(s) for s in cfg_lines)
+    bar_cfg = "-" * max_len
+    print(bar_cfg)
+    for s in cfg_lines:
+        print(s)
+    print(bar_cfg)
+
+    def header() -> None:
+        line = (
+            f"{'t[s]':>{Wt}} "
+            f"{'EMG[mV]':>{Wemg}} "
+            f"{'Pressure[N]':>{Wp}} "
+            f"{'Feeling':<{Wfeel}} "
+            f"{'Pain':>{Wpain}} "
+            f"{'Intensity%':>{Wint}} "
+            f"{'Freq[Hz]':>{Wfreq}}"
+        )
+        bar = "-" * len(line)
+        print(bar)
+        print(line)
+        print(bar)
+
+    def trunc(s: str, width: int) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= width else (s[:max(0, width-1)] + "…")
+
+    # initial header
+    header()
+
     for idx, row in df.iterrows():
         emg = float(row[emg_col])
         press = float(row[press_col])
-        feeling = row[feel_col] if (feel_col in df.columns) else None
+        feeling = row[feel_col] if (feel_col in df.columns) else ""
         pain = feeling_to_score(feeling)
 
         outputs, details = fis.evaluate({"EMG_RMS_mV": emg, "Pressure_N": press, "Pain_Score": pain})
@@ -203,16 +303,27 @@ def evaluate_csv_with_print(fis: SugenoSystem, df: pd.DataFrame,
         out_I.append(I)
         out_F.append(F)
 
-        time_str = f"t={row['time_s']}s | " if 'time_s' in df.columns else ""
-        top_rules = _top_k_rules(details, k=3)
-        parts = []
-        for w, (a, b, c) in top_rules:
-            parts.append(f"w={w:.3f} IF EMG={a} & P={b} & Pain={c}")
-        top_str = " | ".join(parts)
+        if idx and (idx % block == 0):
+            header()
 
-        print(f"{time_str}EMG={emg:.3f} mV, Pressure={press:.2f} N, "
-              f"feeling='{feeling}' -> Pain_Score={pain:.1f} "
-              f"=> Intensity={I:.2f}%, Freq={F:.2f} Hz || {top_str}")
+        t_str = f"{row['time_s']:.1f}" if 'time_s' in df.columns else f"{idx}"
+        line = (
+            f"{t_str:>{Wt}} "
+            f"{emg:>{Wemg}.3f} "
+            f"{press:>{Wp}.2f} "
+            f"{trunc(str(feeling), Wfeel):<{Wfeel}} "
+            f"{pain:>{Wpain}.1f} "
+            f"{I:>{Wint}.2f} "
+            f"{F:>{Wfreq}.2f}"
+        )
+        print(line)
+
+        # Top-k rules (filtered + wrapped)
+        tops = _top_k_rules(details, k=topk)
+        parts = [f"w={w:.3f} " + _fmt_ant(a, b, c, topfmt) for w, (a, b, c) in tops if w >= min_w]
+        if parts:
+            for wrapped_line in _wrap_parts(parts, max_width=max_topline_chars, indent=4, prefix="Top: "):
+                print(wrapped_line)
 
     out_df = df.copy()
     out_df["Pain_Score"] = np.round(pain_scores, 2)
@@ -221,6 +332,7 @@ def evaluate_csv_with_print(fis: SugenoSystem, df: pd.DataFrame,
 
     if out_path:
         out_df.to_csv(out_path, index=False)
+        print("-" * 72)
         print(f"[OK] Wrote outputs to: {out_path}")
     return out_df
 
@@ -231,13 +343,21 @@ def _make_parser():
     p.add_argument("--in", dest="in_path", type=str, default="Muscle_Tension_Data.csv",
                    help="Input CSV path (default: Muscle_Tension_Data.csv).")
     p.add_argument("--out", dest="out_path", type=str, default=None,
-                   help="Output CSV path (default: <input>_withOutputs.csv).")
+                   help="Output CSV path (default: Muscle_Tension_Output.csv).")
     p.add_argument("--emg-col", type=str, default="EMG_RMS_mV",
                    help="Column for EMG (default: EMG_RMS_mV).")
     p.add_argument("--press-col", type=str, default="Pressure_N",
                    help="Column for Pressure (default: Pressure_N).")
     p.add_argument("--feel-col", type=str, default="feeling",
                    help="Column for feeling text (default: feeling).")
+    # printing / filtering params
+    p.add_argument("--topk", type=int, default=3, help="How many top rules to show (default: 3).")
+    p.add_argument("--min-w", type=float, default=0.10, help="Min firing strength to display (default: 0.10).")
+    p.add_argument("--max-topline", type=int, default=None,
+                   help="Max chars for each 'Top:' line; if omitted, auto-detect terminal width.")
+    p.add_argument("--block", type=int, default=25, help="Header repeat interval (rows) (default: 25).")
+    p.add_argument("--topfmt", type=str, choices=[v.value for v in TopFmt], default=TopFmt.compact.value,
+                   help="Format of Top antecedents: 'compact' or 'long' (default: compact).")
     return p
 
 def main():
@@ -253,12 +373,18 @@ def main():
             raise ValueError(f"Missing required column '{col}'. Columns: {list(df.columns)}")
 
     fis = build_massage_chair_sugeno_3in()
-    out_path = args.out_path or os.path.splitext(args.in_path)[0] + "_withOutputs.csv"
+    out_path = args.out_path or "Muscle_Tension_Output.csv"
 
     evaluate_csv_with_print(
         fis, df,
         emg_col=args.emg_col, press_col=args.press_col, feel_col=args.feel_col,
-        out_path=out_path
+        out_path=out_path,
+        dataset_name=os.path.basename(args.in_path),
+        topk=args.topk,
+        min_w=args.min_w,
+        max_topline_chars=args.max_topline,
+        block=args.block,
+        topfmt=TopFmt(args.topfmt),
     )
 
 if __name__ == "__main__":
