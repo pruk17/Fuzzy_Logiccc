@@ -9,12 +9,6 @@
 #   - Intensity_pct (0..100)
 #   - Frequency_Hz  (~8..16)
 #
-# Run:
-#   python fuzzy_sugeno_3in2out_with_feeling_fixed.py
-#   # or
-#   python fuzzy_sugeno_3in2out_with_feeling_fixed.py --in Muscle_Tension_Data.csv --out out.csv \
-#       --emg-col EMG_RMS_mV --press-col Pressure_N --feel-col feeling \
-#       --topk 3 --min-w 0.10 --max-topline 120 --block 25 --topfmt compact
 
 from __future__ import annotations
 
